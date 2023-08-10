@@ -43,6 +43,11 @@ def trace_integration(tracer=None):
     wrapt.wrap_function_wrapper(
         MODULE_NAME, "Client.request", wrap_client_request
     )
+
+    wrapt.wrap_function_wrapper(
+        MODULE_NAME, "AsyncClient.request", wrap_async_client_request
+    )
+
     # pylint: disable=protected-access
     integrations.add_integration(integrations._Integrations.HTTPX)
 
@@ -98,6 +103,77 @@ def wrap_client_request(wrapped, instance, args, kwargs):
 
     try:
         result = wrapped(*args, **kwargs)
+    except httpx.TimeoutException:
+        _span.set_status(exceptions_status.TIMEOUT)
+        raise
+    except httpx.InvalidURL:
+        _span.set_status(exceptions_status.INVALID_URL)
+        raise
+    except Exception as e:
+        _span.set_status(exceptions_status.unknown(e))
+        raise
+    else:
+        # Add the status code to attributes
+        _tracer.add_attribute_to_current_span(
+            HTTP_STATUS_CODE, result.status_code
+        )
+        _span.set_status(utils.status_from_http_code(result.status_code))
+        return result
+    finally:
+        _tracer.end_span()
+
+
+async def wrap_async_client_request(wrapped, instance, args, kwargs):
+    """Wrap the session function to trace it."""
+    # Check if request was sent from an exporter. If so, do not wrap.
+    if execution_context.is_exporter():
+        return await wrapped(*args, **kwargs)
+
+    method = kwargs.get("method") or args[0]
+    url = kwargs.get("url") or args[1]
+
+    excludelist_hostnames = execution_context.get_opencensus_attr(
+        "excludelist_hostnames"
+    )
+    parsed_url = urlparse(url)
+    if parsed_url.port is None:
+        dest_url = parsed_url.hostname
+    else:
+        dest_url = "{}:{}".format(parsed_url.hostname, parsed_url.port)
+    if utils.disable_tracing_hostname(dest_url, excludelist_hostnames):
+        return await wrapped(*args, **kwargs)
+
+    path = parsed_url.path if parsed_url.path else "/"
+
+    _tracer = execution_context.get_opencensus_tracer()
+    _span = _tracer.start_span()
+
+    _span.name = "{}".format(path)
+    _span.span_kind = span_module.SpanKind.CLIENT
+
+    try:
+        tracer_headers = _tracer.propagator.to_headers(_tracer.span_context)
+        kwargs.setdefault("headers", {}).update(tracer_headers)
+    except Exception:  # pragma: NO COVER
+        pass
+
+    # Add the component type to attributes
+    _tracer.add_attribute_to_current_span("component", "HTTP")
+
+    # Add the requests host to attributes
+    _tracer.add_attribute_to_current_span(HTTP_HOST, dest_url)
+
+    # Add the requests method to attributes
+    _tracer.add_attribute_to_current_span(HTTP_METHOD, method.upper())
+
+    # Add the requests path to attributes
+    _tracer.add_attribute_to_current_span(HTTP_PATH, path)
+
+    # Add the requests url to attributes
+    _tracer.add_attribute_to_current_span(HTTP_URL, url)
+
+    try:
+        result = await wrapped(*args, **kwargs)
     except httpx.TimeoutException:
         _span.set_status(exceptions_status.TIMEOUT)
         raise

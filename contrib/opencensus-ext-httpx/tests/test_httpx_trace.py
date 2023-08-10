@@ -29,6 +29,15 @@ class Test_httpx_trace(unittest.TestCase):
         mock_wrap = mock.Mock()
         patch_wrapt = mock.patch("wrapt.wrap_function_wrapper", mock_wrap)
 
+        expected_calls = [
+            mock.call(
+                trace.MODULE_NAME, "Client.request", trace.wrap_client_request
+            ),
+            mock.call(
+                trace.MODULE_NAME, "AsyncClient.request", trace.wrap_async_client_request
+            ),
+        ]
+
         with patch_wrapt:
             trace.trace_integration()
 
@@ -36,13 +45,21 @@ class Test_httpx_trace(unittest.TestCase):
                 execution_context.get_opencensus_tracer(),
                 noop_tracer.NoopTracer,
             )
-            mock_wrap.assert_called_once_with(
-                trace.MODULE_NAME, "Client.request", trace.wrap_client_request
-            )
+
+            self.assertEqual(mock_wrap.call_args_list, expected_calls)
 
     def test_trace_integration_set_tracer(self):
         mock_wrap = mock.Mock()
         patch_wrapt = mock.patch("wrapt.wrap_function_wrapper", mock_wrap)
+
+        expected_calls = [
+            mock.call(
+                trace.MODULE_NAME, "Client.request", trace.wrap_client_request
+            ),
+            mock.call(
+                trace.MODULE_NAME, "AsyncClient.request", trace.wrap_async_client_request
+            ),
+        ]
 
         class TmpTracer(noop_tracer.NoopTracer):
             pass
@@ -53,9 +70,8 @@ class Test_httpx_trace(unittest.TestCase):
             self.assertIsInstance(
                 execution_context.get_opencensus_tracer(), TmpTracer
             )
-            mock_wrap.assert_called_once_with(
-                trace.MODULE_NAME, "Client.request", trace.wrap_client_request
-            )
+
+            self.assertEqual(mock_wrap.call_args_list, expected_calls)
 
     def test_wrap_client_request(self):
         wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
@@ -82,6 +98,56 @@ class Test_httpx_trace(unittest.TestCase):
         with patch, patch_thread:
             trace.wrap_client_request(
                 wrapped, "Client.request", (request_method, url), kwargs
+            )
+
+        expected_attributes = {
+            "component": "HTTP",
+            "http.host": "localhost:8080",
+            "http.method": "POST",
+            "http.path": "/test",
+            "http.status_code": 200,
+            "http.url": url,
+        }
+        expected_name = "/test"
+        expected_status = status_module.Status(0)
+
+        self.assertEqual(
+            span_module.SpanKind.CLIENT, mock_tracer.current_span.span_kind
+        )
+        self.assertEqual(
+            expected_attributes, mock_tracer.current_span.attributes
+        )
+        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_name, mock_tracer.current_span.name)
+        self.assertEqual(
+            expected_status.__dict__, mock_tracer.current_span.status.__dict__
+        )
+
+    async def test_wrap_async_client_request(self):
+        wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
+
+        mock_tracer = MockTracer(
+            propagator=mock.Mock(
+                to_headers=lambda x: {"x-trace": "some-value"})
+        )
+
+        patch = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost:8080/test"
+        request_method = "POST"
+        kwargs = {}
+
+        async with patch, patch_thread:
+            await trace.wrap_async_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), kwargs
             )
 
         expected_attributes = {
@@ -143,6 +209,42 @@ class Test_httpx_trace(unittest.TestCase):
         expected_name = "/"
         self.assertEqual(expected_name, mock_tracer.current_span.name)
 
+    async def test_wrap_async_client_request_excludelist_ok(self):
+        def wrapped(*args, **kwargs):
+            result = mock.Mock()
+            result.status_code = 200
+            return result
+
+        mock_tracer = MockTracer(
+            propagator=mock.Mock(
+                to_headers=lambda x: {"x-trace": "some-value"})
+        )
+
+        patch_tracer = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_attr = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.get_opencensus_attr",
+            return_value=None,
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost/"
+        request_method = "POST"
+
+        async with patch_tracer, patch_attr, patch_thread:
+            await trace.wrap_async_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), {}
+            )
+
+        expected_name = "/"
+        self.assertEqual(expected_name, mock_tracer.current_span.name)
+
     def test_wrap_client_request_excludelist_nok(self):
         def wrapped(*args, **kwargs):
             result = mock.Mock()
@@ -171,6 +273,38 @@ class Test_httpx_trace(unittest.TestCase):
         with patch_tracer, patch_attr, patch_thread:
             trace.wrap_client_request(
                 wrapped, "Client.request", (request_method, url), {}
+            )
+
+        self.assertEqual(None, mock_tracer.current_span)
+
+    async def test_wrap_async_client_request_excludelist_nok(self):
+        def wrapped(*args, **kwargs):
+            result = mock.Mock()
+            result.status_code = 200
+            return result
+
+        mock_tracer = MockTracer()
+
+        patch_tracer = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_attr = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.get_opencensus_attr",
+            return_value=["localhost:8080"],
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost:8080"
+        request_method = "POST"
+
+        async with patch_tracer, patch_attr, patch_thread:
+            await trace.wrap_async_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), {}
             )
 
         self.assertEqual(None, mock_tracer.current_span)
@@ -207,7 +341,39 @@ class Test_httpx_trace(unittest.TestCase):
 
         self.assertEqual(None, mock_tracer.current_span)
 
-    def test_header_is_passed_in(self):
+    async def test_wrap_async_client_request_exporter_thread(self):
+        def wrapped(*args, **kwargs):
+            result = mock.Mock()
+            result.status_code = 200
+            return result
+
+        mock_tracer = MockTracer()
+
+        patch_tracer = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_attr = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.get_opencensus_attr",
+            return_value=["localhost:8080"],
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=True,
+        )
+
+        url = "http://localhost:8080"
+        request_method = "POST"
+
+        async with patch_tracer, patch_attr, patch_thread:
+            await trace.wrap_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), {}
+            )
+
+        self.assertEqual(None, mock_tracer.current_span)
+
+    async def test_header_is_passed_in(self):
         wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
         mock_tracer = MockTracer(
             propagator=mock.Mock(
@@ -226,16 +392,21 @@ class Test_httpx_trace(unittest.TestCase):
 
         url = "http://localhost:8080"
         request_method = "POST"
-        kwargs = {}
+        expected_kwargs = {}
+        expected_async_kwargs = {}
 
-        with patch, patch_thread:
+        async with patch, patch_thread:
             trace.wrap_client_request(
-                wrapped, "Client.request", (request_method, url), kwargs
+                wrapped, "Client.request", (request_method, url), expected_kwargs
+            )
+            await trace.wrap_async_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), expected_async_kwargs
             )
 
-        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_async_kwargs["headers"]["x-trace"], "some-value")
 
-    def test_headers_are_preserved(self):
+    async def test_headers_are_preserved(self):
         wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
         mock_tracer = MockTracer(
             propagator=mock.Mock(
@@ -254,17 +425,23 @@ class Test_httpx_trace(unittest.TestCase):
 
         url = "http://localhost:8080"
         request_method = "POST"
-        kwargs = {"headers": {"key": "value"}}
+        request_kwargs = {"headers": {"key": "value"}}
+        async_request_kwargs = {"headers": {"key": "value"}}
 
-        with patch, patch_thread:
+        async with patch, patch_thread:
             trace.wrap_client_request(
-                wrapped, "Client.request", (request_method, url), kwargs
+                wrapped, "Client.request", (request_method, url), request_kwargs
+            )
+            await trace.wrap_async_client_request(
+                wrapped, "AsyncClient.request", (request_method, url), async_request_kwargs
             )
 
-        self.assertEqual(kwargs["headers"]["key"], "value")
-        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(request_kwargs["headers"]["key"], "value")
+        self.assertEqual(request_kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(async_request_kwargs["headers"]["key"], "value")
+        self.assertEqual(async_request_kwargs["headers"]["x-trace"], "some-value")
 
-    def test_tracer_headers_are_overwritten(self):
+    async def test_tracer_headers_are_overwritten(self):
         wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
         mock_tracer = MockTracer(
             propagator=mock.Mock(
@@ -345,6 +522,57 @@ class Test_httpx_trace(unittest.TestCase):
             expected_status.__dict__, mock_tracer.current_span.status.__dict__
         )
 
+    async def test_wrap_async_client_request_timeout(self):
+        wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
+        wrapped.side_effect = httpx.TimeoutException("timeout")
+
+        mock_tracer = MockTracer(
+            propagator=mock.Mock(
+                to_headers=lambda x: {"x-trace": "some-value"})
+        )
+
+        patch = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost:8080/test"
+        request_method = "POST"
+        kwargs = {}
+
+        async with patch, patch_thread:
+            async with self.assertRaises(httpx.TimeoutException):
+                await trace.wrap_async_client_request(
+                    wrapped, "AsyncClient.request", (request_method, url), kwargs
+                )
+
+        expected_attributes = {
+            "component": "HTTP",
+            "http.host": "localhost:8080",
+            "http.method": "POST",
+            "http.path": "/test",
+            "http.url": url,
+        }
+        expected_name = "/test"
+        expected_status = status_module.Status(4, "request timed out")
+
+        self.assertEqual(
+            span_module.SpanKind.CLIENT, mock_tracer.current_span.span_kind
+        )
+        self.assertEqual(
+            expected_attributes, mock_tracer.current_span.attributes
+        )
+        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_name, mock_tracer.current_span.name)
+        self.assertEqual(
+            expected_status.__dict__, mock_tracer.current_span.status.__dict__
+        )
+
     def test_wrap_client_request_invalid_url(self):
         wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
         wrapped.side_effect = httpx.InvalidURL("invalid url")
@@ -372,6 +600,57 @@ class Test_httpx_trace(unittest.TestCase):
             with self.assertRaises(httpx.InvalidURL):
                 trace.wrap_client_request(
                     wrapped, "Client.request", (request_method, url), kwargs
+                )
+
+        expected_attributes = {
+            "component": "HTTP",
+            "http.host": "localhost:8080",
+            "http.method": "POST",
+            "http.path": "/test",
+            "http.url": url,
+        }
+        expected_name = "/test"
+        expected_status = status_module.Status(3, "invalid URL")
+
+        self.assertEqual(
+            span_module.SpanKind.CLIENT, mock_tracer.current_span.span_kind
+        )
+        self.assertEqual(
+            expected_attributes, mock_tracer.current_span.attributes
+        )
+        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_name, mock_tracer.current_span.name)
+        self.assertEqual(
+            expected_status.__dict__, mock_tracer.current_span.status.__dict__
+        )
+
+    async def test_wrap_async_client_request_invalid_url(self):
+        wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
+        wrapped.side_effect = httpx.InvalidURL("invalid url")
+
+        mock_tracer = MockTracer(
+            propagator=mock.Mock(
+                to_headers=lambda x: {"x-trace": "some-value"})
+        )
+
+        patch = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost:8080/test"
+        request_method = "POST"
+        kwargs = {}
+
+        async with patch, patch_thread:
+            async with self.assertRaises(httpx.InvalidURL):
+                await trace.wrap_async_client_request(
+                    wrapped, "AsyncClient.request", (request_method, url), kwargs
                 )
 
         expected_attributes = {
@@ -447,6 +726,57 @@ class Test_httpx_trace(unittest.TestCase):
             expected_status.__dict__, mock_tracer.current_span.status.__dict__
         )
 
+    async def test_wrap_async_client_request_exception(self):
+        wrapped = mock.Mock(return_value=mock.Mock(status_code=200))
+        wrapped.side_effect = httpx.TooManyRedirects("too many redirects")
+
+        mock_tracer = MockTracer(
+            propagator=mock.Mock(
+                to_headers=lambda x: {"x-trace": "some-value"})
+        )
+
+        patch = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context."
+            "get_opencensus_tracer",
+            return_value=mock_tracer,
+        )
+        patch_thread = mock.patch(
+            "opencensus.ext.httpx.trace.execution_context.is_exporter",
+            return_value=False,
+        )
+
+        url = "http://localhost:8080/test"
+        request_method = "POST"
+        kwargs = {}
+
+        async with patch, patch_thread:
+            async with self.assertRaises(httpx.TooManyRedirects):
+                await trace.wrap_async_client_request(
+                    wrapped, "AsyncClient.request", (request_method, url), kwargs
+                )
+
+        expected_attributes = {
+            "component": "HTTP",
+            "http.host": "localhost:8080",
+            "http.method": "POST",
+            "http.path": "/test",
+            "http.url": url,
+        }
+        expected_name = "/test"
+        expected_status = status_module.Status(2, "too many redirects")
+
+        self.assertEqual(
+            span_module.SpanKind.CLIENT, mock_tracer.current_span.span_kind
+        )
+        self.assertEqual(
+            expected_attributes, mock_tracer.current_span.attributes
+        )
+        self.assertEqual(kwargs["headers"]["x-trace"], "some-value")
+        self.assertEqual(expected_name, mock_tracer.current_span.name)
+        self.assertEqual(
+            expected_status.__dict__, mock_tracer.current_span.status.__dict__
+        )
+
 
 class MockTracer(object):
     def __init__(self, propagator=None):
@@ -469,6 +799,7 @@ class MockTracer(object):
 class MockSpan(object):
     def __init__(self):
         self.attributes = {}
+        self.status = None
 
     def set_status(self, status):
         self.status = status
